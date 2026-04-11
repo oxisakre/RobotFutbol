@@ -12,7 +12,7 @@ const int M4_IN3 = 14; const int M4_IN4 = 15; const int M4_END = 13;
 const int PIN_KICK = 33;
 
 const int vel_max = 255;
-const int vel_giro = 255;
+const int vel_giro = 180;
 
 void setup() {
   // Configuración de los pines de DIRECCIÓN usando las variables
@@ -37,22 +37,22 @@ void loop() {
   delay(5000); // Espera 5 segundos antes de empezar
 
   // Patrón 1: Avanzar (Conjunto)
-  avanzar(vel_giro);
+  avanzar(vel_max);
   frenar();
   patear(); 
 
   // Patrón 2: Retroceder (Conjunto)
-  retroceder(vel_giro);
+  retroceder(vel_max);
   frenar();
   patear(); 
 
   // Patrón 3: Desplazamiento Lateral Derecha (Conjunto)
-  desplazarDerecha(vel_giro);
+  desplazarDerecha(vel_max);
   frenar();
   patear(); 
 
   // Patrón 4: Desplazamiento Lateral Izquierda (Conjunto)
-  desplazarIzquierda(vel_giro);
+  desplazarIzquierda(vel_max);
   frenar();
   patear(); 
 
