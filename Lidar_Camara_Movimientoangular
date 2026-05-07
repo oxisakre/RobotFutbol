@@ -1,0 +1,420 @@
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+#include <utility/imumaths.h>
+#include <math.h>
+
+// ================= IMU =================
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire2);
+float offset_heading  = 0;
+float heading_deseado = 0;
+float ultimo_heading  = 0;
+
+// Constantes de Control PD
+float Kp = 0.015;
+float Kd = 0.08;
+float error_previo = 0;
+float W_prev       = 0;
+
+// ================= PINES =================
+// MOTOR 1 (Adelante-Derecha,   45°)
+const int M1_IN1 = 2;  const int M1_IN2 = 1;  const int M1_ENA = 3;
+// MOTOR 2 (Atras-Derecha,     -45°)
+const int M2_IN3 = 4;  const int M2_IN4 = 5;  const int M2_ENB = 0;
+// MOTOR 3 (Atras-Izquierda,  -135°)
+const int M3_IN1 = 17; const int M3_IN2 = 16; const int M3_ENC = 19;
+// MOTOR 4 (Adelante-Izquierda, 135°)
+const int M4_IN3 = 14; const int M4_IN4 = 15; const int M4_END = 13;
+
+// SOLENOIDE
+const int PIN_KICK = 33;
+
+// LIDAR (RPLIDAR A1)
+// Pin 34 (RX8) -> TX del Lidar (cable Amarillo)
+// Pin 35 (TX8) -> RX del Lidar (cable Verde)
+// Pin 36       -> CTRL_MOTO   (cable Azul, PWM)
+const int PIN_MOTOR_LIDAR = 36;
+
+// DEADZONE (valores minimos de arranque medidos por motor)
+const int MIN_M1 = 172;
+const int MIN_M2 = 180;
+const int MIN_M3 = 170;
+const int MIN_M4 = 148;
+
+// ================= LIDAR: PARSER DE PAQUETES =================
+enum EstadoParser { SYNC_B0, LEE_B1, LEE_B2, LEE_B3, LEE_B4 };
+EstadoParser estado_parser = SYNC_B0;
+uint8_t pkt[5];
+
+// Tabla de distancias: una entrada por grado (0-359), en mm. 0 = sin deteccion.
+float scan_distancias[360];
+bool  scan_nuevo = false; 
+
+// ================= PROTOTIPOS =================
+float normalizeAngle(float angle);
+float getHeading();
+void ejecutarMovimientoEstabilizado(float angulo, int velocidad, unsigned long duracion_ms);
+void moverEnAngulo(float angulo_grados, int velocidad);
+void pivotarDerecha(float nuevo_heading, unsigned long timeout_ms = 3000);
+void frenar();
+void patear();
+void inicializarLiDAR();
+void procesarPaquete();
+void leerLiDAR();
+void imprimirTelemetria();
+float obtenerDistanciaPromedio(int angulo_central);
+void imprimirResumenLiDAR();
+
+// ================= VARIABLES DEBUG =================
+unsigned long ultimo_debug = 0;
+
+// ================= FUNCIONES IMU =================
+
+float normalizeAngle(float angle) {
+  if (isnan(angle) || isinf(angle)) return 0.0;
+  float mod_angle = fmod(angle + 180.0, 360.0);
+  if (mod_angle < 0) mod_angle += 360.0;
+  return mod_angle - 180.0;
+}
+
+float getHeading() {
+  sensors_event_t event;
+  bno.getEvent(&event);
+  return normalizeAngle(event.orientation.x - offset_heading);
+}
+
+// ================= SETUP =================
+
+void setup() {
+  Serial.begin(115200);
+
+  int pines_dir[] = {M1_IN1, M1_IN2, M2_IN3, M2_IN4, M3_IN1, M3_IN2, M4_IN3, M4_IN4};
+  for (int i = 0; i < 8; i++) pinMode(pines_dir[i], OUTPUT);
+
+  pinMode(M1_ENA, OUTPUT); pinMode(M2_ENB, OUTPUT);
+  pinMode(M3_ENC, OUTPUT); pinMode(M4_END, OUTPUT);
+
+  pinMode(PIN_KICK, OUTPUT);
+  digitalWrite(PIN_KICK, LOW);
+
+  for (int i = 0; i < 360; i++) scan_distancias[i] = 0.0f;
+
+  inicializarLiDAR();
+
+  Wire2.begin();
+  if (!bno.begin()) {
+    Serial.println("No BNO055 detectado... revisa cableado.");
+    while (1);
+  }
+
+  delay(1000);
+  bno.setExtCrystalUse(true);
+
+  sensors_event_t event;
+  bno.getEvent(&event);
+  offset_heading = event.orientation.x;
+  ultimo_heading = 0;
+
+  frenar();
+  Serial.println("Sistema listo.");
+}
+
+// ================= LOOP =================
+
+void loop() {
+  // Espera inicial no bloqueante para estabilizar LiDAR
+  unsigned long inicio_espera = millis();
+  while(millis() - inicio_espera < 5000) {
+    leerLiDAR();
+    delay(15);
+  }
+
+  int vel     = 200;
+  int t_mov   = 1500;
+  int t_pausa = 500;
+
+  // 1. Eje Y (Adelante y Atras)
+  ejecutarMovimientoEstabilizado(0, vel, t_mov); 
+  frenar(); ejecutarMovimientoEstabilizado(0, 0, t_pausa);
+  
+  ejecutarMovimientoEstabilizado(180, vel, t_mov); 
+  frenar(); ejecutarMovimientoEstabilizado(0, 0, t_pausa);
+
+  // 2. Eje X (Derecha e Izquierda)
+  ejecutarMovimientoEstabilizado(-90, vel, t_mov); 
+  frenar(); ejecutarMovimientoEstabilizado(0, 0, t_pausa);
+  
+  ejecutarMovimientoEstabilizado( 90, vel, t_mov); 
+  frenar(); ejecutarMovimientoEstabilizado(0, 0, t_pausa);
+
+  // 3. Diagonal 1 (Adelante-Derecha / Atras-Izquierda)
+  ejecutarMovimientoEstabilizado(-45,  vel, t_mov); 
+  frenar(); ejecutarMovimientoEstabilizado(0, 0, t_pausa);
+  
+  ejecutarMovimientoEstabilizado( 135, vel, t_mov); 
+  frenar(); ejecutarMovimientoEstabilizado(0, 0, t_pausa);
+
+  // 4. Diagonal 2 (Adelante-Izquierda / Atras-Derecha)
+  ejecutarMovimientoEstabilizado( 45,  vel, t_mov); 
+  frenar(); ejecutarMovimientoEstabilizado(0, 0, t_pausa);
+  
+  ejecutarMovimientoEstabilizado(-135, vel, t_mov); 
+  frenar(); ejecutarMovimientoEstabilizado(0, 0, t_pausa);
+
+  // 5. Giro 360° (2 x 180° por limitacion del PID de heading)
+  pivotarDerecha(180, 3000);
+  pivotarDerecha(180, 3000);
+  frenar(); ejecutarMovimientoEstabilizado(0, 0, t_pausa);
+
+  // 6. Patada
+  frenar(); 
+  patear();
+
+  Serial.println("Rutina completada. Modo diagnostico activo.");
+  while (1) {
+    ultimo_heading = getHeading();
+    leerLiDAR();
+    imprimirTelemetria();
+    if (scan_nuevo) {
+      imprimirResumenLiDAR();
+      scan_nuevo = false;
+    }
+    delay(15);
+  }
+}
+
+// ==========================================
+//        FUNCIONES DE CONTROL Y MOVIMIENTO
+// ==========================================
+
+void ejecutarMovimientoEstabilizado(float angulo, int velocidad, unsigned long duracion_ms) {
+  error_previo = 0;
+  W_prev = 0;
+
+  unsigned long inicio = millis();
+  while (millis() - inicio < duracion_ms) {
+    moverEnAngulo(angulo, velocidad);
+    leerLiDAR();
+    imprimirTelemetria();
+    
+    // Imprime resumen del entorno durante el trayecto si hay datos nuevos
+    if (scan_nuevo) {
+      imprimirResumenLiDAR();
+      scan_nuevo = false;
+    }
+    
+    delay(15);
+  }
+}
+
+void moverEnAngulo(float angulo_grados, int velocidad) {
+  // ===== IMU Y CONTROL PD =====
+  ultimo_heading = getHeading();
+  float error = normalizeAngle(heading_deseado - ultimo_heading);
+
+  if (abs(error) < 6.0) error = 0.0;
+
+  float derivativa = error - error_previo;
+  float W_target = (Kp * error) + (Kd * derivativa);
+  error_previo = error;
+
+  if (W_target >  1.0) W_target =  1.0;
+  if (W_target < -1.0) W_target = -1.0;
+
+  float max_delta_W = 0.1;
+  if      (W_target > W_prev + max_delta_W) W_prev += max_delta_W;
+  else if (W_target < W_prev - max_delta_W) W_prev -= max_delta_W;
+  else                                       W_prev  = W_target;
+
+  float W = W_prev;
+
+  // ===== CINEMATICA X-DRIVE =====
+  float radianes     = angulo_grados * (PI / 180.0);
+  float ratio_lineal = constrain(velocidad, 0, 255) / 255.0;
+
+  float Vy = cos(radianes) * ratio_lineal;
+  float Vx = -sin(radianes) * ratio_lineal;
+
+  float vel_M1 = Vy - Vx - W;
+  float vel_M2 = Vy + Vx - W;
+  float vel_M3 = Vy - Vx + W;
+  float vel_M4 = Vy + Vx + W;
+
+  float max_vel = max(max(abs(vel_M1), abs(vel_M2)), max(abs(vel_M3), abs(vel_M4)));
+  if (max_vel > 1.0) {
+    vel_M1 /= max_vel; vel_M2 /= max_vel;
+    vel_M3 /= max_vel; vel_M4 /= max_vel;
+  }
+
+  // ===== PWM Y ZONA MUERTA =====
+  int pwm_M1 = 0, pwm_M2 = 0, pwm_M3 = 0, pwm_M4 = 0;
+  float umbral_ruido = max(0.04f, 0.15f * ratio_lineal);
+
+  if (abs(vel_M1) > umbral_ruido) pwm_M1 = MIN_M1 + round(abs(vel_M1) * (255 - MIN_M1));
+  if (abs(vel_M2) > umbral_ruido) pwm_M2 = MIN_M2 + round(abs(vel_M2) * (255 - MIN_M2));
+  if (abs(vel_M3) > umbral_ruido) pwm_M3 = MIN_M3 + round(abs(vel_M3) * (255 - MIN_M3));
+  if (abs(vel_M4) > umbral_ruido) pwm_M4 = MIN_M4 + round(abs(vel_M4) * (255 - MIN_M4));
+
+  // ===== DIRECCION Y FRENO =====
+  if (pwm_M1 == 0) { digitalWrite(M1_IN1, LOW);       digitalWrite(M1_IN2, LOW);       }
+  else             { digitalWrite(M1_IN1, vel_M1 > 0); digitalWrite(M1_IN2, vel_M1 < 0); }
+  if (pwm_M2 == 0) { digitalWrite(M2_IN3, LOW);       digitalWrite(M2_IN4, LOW);       }
+  else             { digitalWrite(M2_IN3, vel_M2 > 0); digitalWrite(M2_IN4, vel_M2 < 0); }
+  if (pwm_M3 == 0) { digitalWrite(M3_IN1, LOW);       digitalWrite(M3_IN2, LOW);       }
+  else             { digitalWrite(M3_IN1, vel_M3 > 0); digitalWrite(M3_IN2, vel_M3 < 0); }
+  if (pwm_M4 == 0) { digitalWrite(M4_IN3, LOW);       digitalWrite(M4_IN4, LOW);       }
+  else             { digitalWrite(M4_IN3, vel_M4 > 0); digitalWrite(M4_IN4, vel_M4 < 0); }
+
+  analogWrite(M1_ENA, pwm_M1); analogWrite(M2_ENB, pwm_M2);
+  analogWrite(M3_ENC, pwm_M3); analogWrite(M4_END, pwm_M4);
+}
+
+// ================= AUX =================
+
+void pivotarDerecha(float nuevo_heading, unsigned long timeout_ms) {
+  heading_deseado = normalizeAngle(heading_deseado + nuevo_heading);
+  ejecutarMovimientoEstabilizado(0, 0, timeout_ms);
+}
+
+void frenar() {
+  digitalWrite(M1_IN1, LOW); digitalWrite(M1_IN2, LOW);
+  digitalWrite(M2_IN3, LOW); digitalWrite(M2_IN4, LOW);
+  digitalWrite(M3_IN1, LOW); digitalWrite(M3_IN2, LOW);
+  digitalWrite(M4_IN3, LOW); digitalWrite(M4_IN4, LOW);
+  analogWrite(M1_ENA, 0); analogWrite(M2_ENB, 0);
+  analogWrite(M3_ENC, 0); analogWrite(M4_END, 0);
+}
+
+void patear() {
+  digitalWrite(PIN_KICK, HIGH);
+  delay(150);
+  digitalWrite(PIN_KICK, LOW);
+  delay(7000);
+}
+
+// ================= FUNCIONES LIDAR =================
+
+void inicializarLiDAR() {
+  pinMode(PIN_MOTOR_LIDAR, OUTPUT);
+  analogWrite(PIN_MOTOR_LIDAR, 150);
+  Serial8.begin(115200);
+  delay(1000);
+  Serial8.write(0xA5);
+  Serial8.write(0x20);
+  Serial.println("LiDAR: START_SCAN enviado.");
+}
+
+void procesarPaquete() {
+  if (pkt[0] & 0x01) scan_nuevo = true;
+
+  uint8_t quality = pkt[0] >> 2;
+  if (quality == 0) return;
+
+  uint16_t raw16    = (uint16_t)pkt[1] | ((uint16_t)pkt[2] << 8);
+  uint16_t angle_q6 = raw16 >> 1;
+  float    angle_deg = angle_q6 / 64.0f;
+
+  uint16_t dist_q2 = (uint16_t)pkt[3] | ((uint16_t)pkt[4] << 8);
+  float    dist_mm  = dist_q2 / 4.0f;
+
+  if (dist_mm == 0.0f) return;
+
+  int idx = (int)angle_deg % 360;
+  scan_distancias[idx] = dist_mm;
+}
+
+void leerLiDAR() {
+  while (Serial8.available()) {
+    uint8_t b = Serial8.read();
+
+    switch (estado_parser) {
+      case SYNC_B0:
+        if (((b & 0x01) ^ ((b >> 1) & 0x01)) == 1) {
+          pkt[0] = b;
+          estado_parser = LEE_B1;
+        }
+        break;
+
+      case LEE_B1:
+        if (b & 0x01) {
+          pkt[1] = b;
+          estado_parser = LEE_B2;
+        } else {
+          estado_parser = SYNC_B0;
+        }
+        break;
+
+      case LEE_B2:
+        pkt[2] = b;
+        estado_parser = LEE_B3;
+        break;
+
+      case LEE_B3:
+        pkt[3] = b;
+        estado_parser = LEE_B4;
+        break;
+
+      case LEE_B4:
+        pkt[4] = b;
+        procesarPaquete();
+        estado_parser = SYNC_B0;
+        break;
+    }
+  }
+}
+
+// Telemetria IMU a 5 Hz
+void imprimirTelemetria() {
+  if (millis() - ultimo_debug > 200) {
+    ultimo_debug = millis();
+    float error = normalizeAngle(heading_deseado - ultimo_heading);
+    Serial.print("IMU H: "); Serial.print(ultimo_heading, 1);
+    Serial.print("  | Err: "); Serial.print(error, 1);
+    Serial.println("  ");
+  }
+}
+
+float obtenerDistanciaPromedio(int angulo_central) {
+  float suma = 0;
+  int conteo = 0;
+  for (int i = -2; i <= 2; i++) {
+    int idx = (angulo_central + i + 360) % 360;
+    if (scan_distancias[idx] > 0.0f) {
+      suma += scan_distancias[idx];
+      conteo++;
+    }
+  }
+  return (conteo > 0) ? (suma / conteo) : 0.0f;
+}
+
+// Resumen LiDAR: se imprime una vez por revolucion completa del sensor
+void imprimirResumenLiDAR() {
+  float dist_min = 99999.0f;
+  int   ang_min  = -1;
+
+  for (int i = 0; i < 360; i++) {
+    if (scan_distancias[i] > 0.0f && scan_distancias[i] < dist_min) {
+      dist_min = scan_distancias[i];
+      ang_min  = i;
+    }
+  }
+
+  // Cardinales con ventana +/- 2 grados
+  float d_front = obtenerDistanciaPromedio(0);
+  float d_left  = obtenerDistanciaPromedio(90);
+  float d_back  = obtenerDistanciaPromedio(180);
+  float d_right = obtenerDistanciaPromedio(270);
+
+  Serial.print("LIDAR | Min: ");
+  if (ang_min >= 0) {
+    Serial.print(dist_min / 1000.0f, 2);
+    Serial.print("m @ "); Serial.print(ang_min); Serial.print("deg");
+  } else {
+    Serial.print("sin deteccion");
+  }
+  Serial.print(" | F:"); Serial.print(d_front / 1000.0f, 2);
+  Serial.print("m L:");  Serial.print(d_left  / 1000.0f, 2);
+  Serial.print("m B:");  Serial.print(d_back  / 1000.0f, 2);
+  Serial.print("m R:");  Serial.print(d_right / 1000.0f, 2);
+  Serial.println("m");
+}
